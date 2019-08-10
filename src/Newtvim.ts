@@ -24,9 +24,9 @@ import {
   mergeMap,
   tap
 } from 'rxjs/operators';
-import { attach, NeovimClient } from 'neovim';
+import { attach, NeovimClient, Buffer } from 'neovim';
 import { spawn, ChildProcess } from 'child_process';
-import { fromVsCodeCommand, fromVsCodeEvent } from './utils';
+import { fromVsCodeCommand, fromVsCodeEvent, InferEventArgs } from './utils';
 import { BufferManager, BufferEntry } from './BufferManager';
 import { Screen, VimMode } from './Screen';
 
@@ -37,6 +37,20 @@ export class Newtvim extends vscode.Disposable {
   private disposed$ = new Subject<void>();
   private type$ = fromVsCodeCommand<{ text: string }>('type').pipe(
     takeUntil(this.disposed$),
+    share()
+  );
+
+  private insertModeKeyFeed$ = this.type$.pipe(
+    withLatestFrom(defer(() => this.screen.mode$)),
+    filter(([, mode]) => mode === VimMode.INSERT),
+    map(([arg]) => arg),
+    share()
+  );
+
+  private neovimKeyFeed$ = this.type$.pipe(
+    withLatestFrom(defer(() => this.screen.mode$)),
+    filter(([, mode]) => mode !== VimMode.INSERT),
+    map(([arg]) => arg),
     share()
   );
 
@@ -63,19 +77,22 @@ export class Newtvim extends vscode.Disposable {
     )
     .pipe(share());
 
+  private client!: NeovimClient;
   private buffersManager = new BufferManager(this.client$);
   private screen = new Screen();
 
   constructor(private neovimPath: string) {
     super(() => {});
 
-    this.type$
-      .pipe(withLatestFrom(this.client$, this.screen.mode$))
-      .subscribe(([arg, client, mode]) =>
-        mode === VimMode.INSERT
-          ? vscode.commands.executeCommand('default:type', arg)
-          : client.feedKeys(arg.text, 't', true)
-      );
+    this.client$.subscribe(client => (this.client = client));
+
+    this.neovimKeyFeed$
+      .pipe(withLatestFrom(this.client$))
+      .subscribe(([arg, client]) => client.feedKeys(arg.text, 't', true));
+
+    this.insertModeKeyFeed$.subscribe(arg =>
+      vscode.commands.executeCommand('default:type', arg)
+    );
 
     this.screen.cursorPosition$
       .pipe(withLatestFrom(this.activeTextEditor$))
@@ -89,6 +106,14 @@ export class Newtvim extends vscode.Disposable {
 
     this.buffersManager.linesChanged$.subscribe(event => {
       this.handleBufferLineEvent(event.startLine, event.endLine, event.content);
+    });
+
+    this.buffersManager.vsDocumentChanged$.subscribe(event => {
+      this.handleVsDocumentChange(
+        event.buffer,
+        event.document,
+        event.contentChanges
+      );
     });
 
     // When the active text editor changes, wait for the buffer to be created is it doesn't exist already.
@@ -153,7 +178,10 @@ export class Newtvim extends vscode.Disposable {
 
         if (line) {
           if (lineContent !== undefined) {
-            builder.replace(line.rangeIncludingLineBreak, lineContent);
+            builder.replace(
+              line.rangeIncludingLineBreak,
+              contentIndex >= content.length ? lineContent : `${lineContent}\n`
+            );
           } else {
             builder.delete(line.rangeIncludingLineBreak);
           }
@@ -163,11 +191,39 @@ export class Newtvim extends vscode.Disposable {
             new vscode.Position(i, Number.MAX_SAFE_INTEGER)
           );
 
-          builder.insert(range.start, `\n${lineContent}`);
+          builder.insert(range.start, lineContent);
         }
       }
 
       return Promise.resolve(true);
     });
+  }
+
+  private async handleVsDocumentChange(
+    buffer: Buffer,
+    document: vscode.TextDocument,
+    changes: vscode.TextDocumentContentChangeEvent[]
+  ): Promise<void> {
+    for (const change of changes) {
+      const bufferLines = await buffer.lines;
+      const startLine = change.range.start.line;
+      const endLine = change.range.end.line;
+      const lineCount = document.lineCount;
+      let lines = [] as string[];
+      let hasChanged = false;
+
+      for (let i = startLine; i <= endLine; i++) {
+        const content = i >= lineCount ? '' : document.lineAt(i).text;
+
+        hasChanged = hasChanged || bufferLines[i] !== content;
+        lines.push(content);
+      }
+
+      if (hasChanged) {
+        buffer.replace(lines, startLine);
+      }
+
+      console.log(hasChanged);
+    }
   }
 }
