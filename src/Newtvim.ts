@@ -104,18 +104,6 @@ export class Newtvim extends vscode.Disposable {
           ))
       );
 
-    this.buffersManager.linesChanged$.subscribe(event => {
-      this.handleBufferLineEvent(event.startLine, event.endLine, event.content);
-    });
-
-    this.buffersManager.vsDocumentChanged$.subscribe(event => {
-      this.handleVsDocumentChange(
-        event.buffer,
-        event.document,
-        event.contentChanges
-      );
-    });
-
     // When the active text editor changes, wait for the buffer to be created is it doesn't exist already.
     // Then make the active buffer in neovim the same as vscodes.
     this.activeTextEditor$
@@ -160,70 +148,5 @@ export class Newtvim extends vscode.Disposable {
   dispose(): void {
     this.disposed$.next();
     this.disposed$.complete();
-  }
-
-  private async handleBufferLineEvent(
-    startLine: number,
-    endLine: number,
-    content: string[]
-  ): Promise<void> {
-    await vscode.window.activeTextEditor!.edit(builder => {
-      let contentIndex = 0;
-      const editor = vscode.window.activeTextEditor!.document;
-      const lineCount = vscode.window.activeTextEditor!.document.lineCount;
-
-      for (let i = startLine; i < endLine; i++) {
-        const line = i >= lineCount ? null : editor.lineAt(i);
-        const lineContent = content[contentIndex++];
-
-        if (line) {
-          if (lineContent !== undefined) {
-            builder.replace(
-              line.rangeIncludingLineBreak,
-              contentIndex >= content.length ? lineContent : `${lineContent}\n`
-            );
-          } else {
-            builder.delete(line.rangeIncludingLineBreak);
-          }
-        } else {
-          const range = new vscode.Range(
-            new vscode.Position(i, 0),
-            new vscode.Position(i, Number.MAX_SAFE_INTEGER)
-          );
-
-          builder.insert(range.start, lineContent);
-        }
-      }
-
-      return Promise.resolve(true);
-    });
-  }
-
-  private async handleVsDocumentChange(
-    buffer: Buffer,
-    document: vscode.TextDocument,
-    changes: vscode.TextDocumentContentChangeEvent[]
-  ): Promise<void> {
-    for (const change of changes) {
-      const bufferLines = await buffer.lines;
-      const startLine = change.range.start.line;
-      const endLine = change.range.end.line;
-      const lineCount = document.lineCount;
-      let lines = [] as string[];
-      let hasChanged = false;
-
-      for (let i = startLine; i <= endLine; i++) {
-        const content = i >= lineCount ? '' : document.lineAt(i).text;
-
-        hasChanged = hasChanged || bufferLines[i] !== content;
-        lines.push(content);
-      }
-
-      if (hasChanged) {
-        buffer.replace(lines, startLine);
-      }
-
-      console.log(hasChanged);
-    }
   }
 }
