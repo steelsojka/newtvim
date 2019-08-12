@@ -8,7 +8,8 @@ import {
   defer,
   merge,
   Subscriber,
-  Subscription
+  Subscription,
+  of
 } from 'rxjs';
 import {
   startWith,
@@ -22,13 +23,15 @@ import {
   map,
   filter,
   mergeMap,
-  tap
+  tap,
+  pairwise
 } from 'rxjs/operators';
 import { attach, NeovimClient, Buffer } from 'neovim';
 import { spawn, ChildProcess } from 'child_process';
 import { fromVsCodeCommand, fromVsCodeEvent, InferEventArgs } from './utils';
 import { BufferManager, BufferEntry } from './BufferManager';
 import { Screen, VimMode } from './Screen';
+import { RSA_X931_PADDING } from 'constants';
 
 export class Newtvim extends vscode.Disposable {
   private _client$ = new ReplaySubject<NeovimClient>(1);
@@ -77,6 +80,18 @@ export class Newtvim extends vscode.Disposable {
     )
     .pipe(share());
 
+  private readonly activeBufferEntry$ = this.activeTextEditor$.pipe(
+    switchMap(editor =>
+      editor
+        ? this.buffersManager.waitUntilBufferExists(
+            editor!.document.uri.toString()
+          )
+        : of(null)
+    ),
+    tap(v => console.log('v', v)),
+    shareReplay(1)
+  );
+
   private client!: NeovimClient;
   private buffersManager = new BufferManager(this.client$);
   private screen = new Screen();
@@ -95,7 +110,10 @@ export class Newtvim extends vscode.Disposable {
     );
 
     this.screen.cursorPosition$
-      .pipe(withLatestFrom(this.activeTextEditor$))
+      .pipe(
+        withLatestFrom(this.activeTextEditor$, this.screen.mode$),
+        filter(([, , mode]) => mode !== VimMode.INSERT)
+      )
       .subscribe(
         ([pos, editor]) =>
           (editor!.selection = new vscode.Selection(
@@ -106,21 +124,36 @@ export class Newtvim extends vscode.Disposable {
 
     // When the active text editor changes, wait for the buffer to be created is it doesn't exist already.
     // Then make the active buffer in neovim the same as vscodes.
-    this.activeTextEditor$
+    this.activeBufferEntry$
       .pipe(
-        filter(maybeEditor => Boolean(maybeEditor)),
-        switchMap(editor =>
-          this.buffersManager.buffers$.pipe(
-            filter<{ [key: string]: Observable<BufferEntry> }>(buffers =>
-              buffers.hasOwnProperty(editor!.document.uri.toString())
-            ),
-            mergeMap(buffers => buffers[editor!.document.uri.toString()]),
-            take(1)
-          )
-        ),
+        filter(value => Boolean(value)),
         withLatestFrom(this.client$)
       )
-      .subscribe(([entry, client]) => client.command(`b! ${entry.buffer.id}`));
+      .subscribe(([entry, client]) => {
+        if (entry) {
+          client.command(`b! ${entry.buffer.id}`);
+        }
+      });
+
+    this.screen.mode$
+      .pipe(
+        pairwise(),
+        filter(
+          ([prev, next]) => prev === VimMode.INSERT && next !== VimMode.INSERT
+        ),
+        withLatestFrom(this.activeBufferEntry$)
+      )
+      .subscribe(async ([, entry]) => {
+        if (entry) {
+          const lines = await entry.buffer.lines;
+
+          await entry.buffer.setLines(entry.document.getText().split('\n'), {
+            start: 0,
+            end: lines.length,
+            strictIndexing: false
+          });
+        }
+      });
 
     this.notifications$
       .pipe(filter(event => event[0] === 'redraw'))

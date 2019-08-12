@@ -7,8 +7,10 @@ import {
   of,
   ConnectableObservable,
   Subscription,
-  BehaviorSubject
+  BehaviorSubject,
+  OperatorFunction
 } from 'rxjs';
+import { range, pull, attempt } from 'lodash';
 import { NeovimClient, Buffer } from 'neovim';
 import {
   scan,
@@ -21,7 +23,10 @@ import {
   tap,
   takeUntil,
   share,
-  filter
+  filter,
+  switchMap,
+  take,
+  publishLast
 } from 'rxjs/operators';
 
 import { Disposable } from './Disposable';
@@ -129,13 +134,23 @@ export class BufferEntry extends Subscription {
         const lineCount = document.lineCount;
         let lines = [] as string[];
 
-        for (let i = startLine; i <= endLine; i++) {
-          const content = i >= lineCount ? '' : document.lineAt(i).text;
-
-          lines.push(content);
+        if (
+          !change.text &&
+          !change.range.isEmpty &&
+          !change.range.isSingleLine
+        ) {
+          await this.buffer.remove(endLine, endLine + 1, false);
+        } else {
+          for (let i = startLine; i <= endLine; i++) {
+            if (i >= lineCount) {
+              await this.buffer.append(change.text);
+            } else {
+              await this.buffer.replace(document.lineAt(i).text, i);
+            }
+          }
         }
 
-        await this.buffer.replace(lines, startLine);
+        // await this.buffer.replace(lines, startLine);
         console.log('vscode -> nvim: updated');
       }
     });
@@ -148,38 +163,63 @@ export class BufferEntry extends Subscription {
     content: string[],
     textEditor: vscode.TextEditor
   ): Promise<void> {
-    console.log('nvim -> vscode: start');
+    console.log('nvim -> vscode: start', startLine, endLine, content);
 
     await this.syncToVscode(async () => {
       await textEditor.edit(builder => {
         let contentIndex = 0;
         const editor = this.document;
         const lineCount = this.document.lineCount;
+        const linesNeedDeleted = range(startLine, endLine);
 
-        for (let i = startLine; i < endLine; i++) {
-          const line = i >= lineCount ? null : editor.lineAt(i);
-          const lineContent = content[contentIndex++];
+        for (let i = 0, len = content.length; i < len; i++) {
+          const lineNumber = i + startLine;
+          let lineContent = content[i];
+          const range = new vscode.Range(
+            new vscode.Position(lineNumber, 0),
+            new vscode.Position(lineNumber + 1, 0)
+          );
 
-          if (line) {
-            if (lineContent !== undefined) {
-              builder.replace(
-                line.rangeIncludingLineBreak,
-                contentIndex >= content.length
-                  ? lineContent
-                  : `${lineContent}\n`
-              );
-            } else {
-              builder.delete(line.rangeIncludingLineBreak);
-            }
-          } else {
-            const range = new vscode.Range(
-              new vscode.Position(i, 0),
-              new vscode.Position(i, Number.MAX_SAFE_INTEGER)
+          if (lineNumber >= endLine) {
+            builder.insert(
+              new vscode.Position(lineNumber, 0),
+              lineContent + '\n'
             );
-
-            builder.insert(range.start, lineContent);
+          } else {
+            builder.replace(range, lineContent + '\n');
           }
+
+          pull(linesNeedDeleted, lineNumber);
         }
+
+        for (const lineNumber of linesNeedDeleted) {
+          builder.delete(
+            new vscode.Range(
+              new vscode.Position(lineNumber, 0),
+              new vscode.Position(lineNumber + 1, 0)
+            )
+          );
+        }
+
+        // for (let i = startLine; i < endLine; i++) {
+        //   const line = i >= lineCount ? null : editor.lineAt(i);
+        //   const lineContent = content[contentIndex++];
+
+        //   if (line) {
+        //     if (lineContent !== undefined) {
+        //       builder.replace(line.rangeIncludingLineBreak, lineContent);
+        //     } else {
+        //       builder.delete(line.rangeIncludingLineBreak);
+        //     }
+        //   } else {
+        //     const range = new vscode.Range(
+        //       new vscode.Position(i, 0),
+        //       new vscode.Position(i, Number.MAX_SAFE_INTEGER)
+        //     );
+
+        //     builder.insert(range.start, lineContent);
+        //   }
+        // }
 
         console.log('nvim -> vscode: updated');
         return Promise.resolve(true);
@@ -226,6 +266,10 @@ export class BufferManager extends Disposable {
     withLatestFrom(this.client$),
     scan(
       (state, [event, client]) => {
+        if (event === null) {
+          return state;
+        }
+
         switch (event.type) {
           case this.onDidInitialize: {
             return (event.payload as InferEventArgs<
@@ -283,7 +327,6 @@ export class BufferManager extends Disposable {
       },
       {} as { [key: string]: Observable<BufferEntry> }
     ),
-    startWith({}),
     shareReplay(1)
   );
 
@@ -297,12 +340,21 @@ export class BufferManager extends Disposable {
   constructor(private client$: Observable<NeovimClient>) {
     super();
 
-    // this.buffers$.subscribe(console.log);
-    // this._linesChanged$.subscribe(console.log);
+    this.buffers$.subscribe();
 
     this.client$.subscribe(() => {
       this._onDidInitialize.fire(vscode.workspace.textDocuments);
     });
+  }
+
+  public waitUntilBufferExists(uri: string): Observable<BufferEntry> {
+    return this.buffers$.pipe(
+      filter<{ [key: string]: Observable<BufferEntry> }>(buffers =>
+        buffers.hasOwnProperty(uri)
+      ),
+      mergeMap(buffers => buffers[uri]),
+      take(1)
+    );
   }
 
   private setupBuffer(

@@ -37,9 +37,12 @@ export class Screen {
 
   public readonly cursorPosition$ = this.updated$.pipe(
     map(() => ({ x: this.cursorX, y: this.cursorY })),
-    startWith({ x: this.cursorX, y: this.cursorY }),
-    distinctUntilChanged((a, b) => a.x === b.x && a.y === b.y),
-    shareReplay(1)
+    // startWith({ x: this.cursorX, y: this.cursorY }),
+    distinctUntilChanged((a, b) => {
+      return !b || (a.x === b.x && a.y === b.y);
+    }),
+    shareReplay(1),
+    tap(v => console.log('cursor pos:', v.x, v.y))
   );
 
   private handlers = new Map<RedrawEvent, RedrawEventHandler>([
